@@ -215,7 +215,25 @@ def merge_domains(
     return out
 
 
-def _extract_plain_text_vars(settings: Dict[str, Any]) -> Dict[str, str]:
+def _binding_domain_value(binding: Dict[str, Any]) -> str:
+    """从单个 binding 提取可被 parse_domains_json 解析的字符串。"""
+    btype = str(binding.get("type") or "")
+    if btype == "json":
+        raw = binding.get("json")
+        if isinstance(raw, list):
+            return json.dumps(raw, ensure_ascii=False)
+        if raw is None:
+            return ""
+        return str(raw)
+    if "text" in binding:
+        return str(binding.get("text") or "")
+    if "value" in binding:
+        return str(binding.get("value") or "")
+    return ""
+
+
+def _extract_domain_vars(settings: Dict[str, Any]) -> Dict[str, str]:
+    """读取 Worker 上的 DOMAINS / DEFAULT_DOMAINS（支持 plain_text 与 json）。"""
     result = settings.get("result") or {}
     out: Dict[str, str] = {}
     bindings = result.get("bindings")
@@ -224,25 +242,137 @@ def _extract_plain_text_vars(settings: Dict[str, Any]) -> Dict[str, str]:
             if not isinstance(binding, dict):
                 continue
             name = binding.get("name")
-            btype = binding.get("type")
-            if name in ("DOMAINS", "DEFAULT_DOMAINS") and btype in (
-                "plain_text",
-                "secret_text",
-                "text",
-            ):
-                if "text" in binding:
-                    out[name] = str(binding["text"])
-                elif "value" in binding:
-                    out[name] = str(binding["value"])
+            if name not in ("DOMAINS", "DEFAULT_DOMAINS"):
+                continue
+            out[str(name)] = _binding_domain_value(binding)
     vars_obj = result.get("vars") or result.get("environment_variables")
     if isinstance(vars_obj, dict):
         for key in ("DOMAINS", "DEFAULT_DOMAINS"):
-            if key in vars_obj:
-                value = vars_obj[key]
-                if isinstance(value, dict) and "value" in value:
-                    out[key] = str(value["value"])
-                else:
-                    out[key] = str(value)
+            if key in out:
+                continue
+            if key not in vars_obj:
+                continue
+            value = vars_obj[key]
+            if isinstance(value, dict) and "value" in value:
+                out[key] = str(value["value"])
+            elif isinstance(value, list):
+                out[key] = json.dumps(value, ensure_ascii=False)
+            else:
+                out[key] = str(value)
+    return out
+
+
+# 兼容旧名
+def _extract_plain_text_vars(settings: Dict[str, Any]) -> Dict[str, str]:
+    return _extract_domain_vars(settings)
+
+
+def _detect_domains_binding_type(bindings: Optional[List[dict]]) -> str:
+    """优先沿用现有 DOMAINS 绑定类型；默认 json（cloudflare_temp_email 常见）。"""
+    for binding in bindings or []:
+        if not isinstance(binding, dict):
+            continue
+        if binding.get("name") not in ("DOMAINS", "DEFAULT_DOMAINS"):
+            continue
+        btype = str(binding.get("type") or "").strip()
+        if btype in ("json", "plain_text", "text"):
+            return "json" if btype == "json" else "plain_text"
+    return "json"
+
+
+def _sanitize_binding_for_rewrite(binding: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    将 GET settings 返回的 binding 规范化为可安全 PATCH 回写的形态。
+
+    关键规则：
+    - secret_text：只回传 name+type，不带 text（CF 会保留原 secret 值）
+    - d1：只回传 name + database_id
+    - 绝不在「不完整 bindings 列表」上成功写入
+    """
+    if not isinstance(binding, dict):
+        return None
+    name = str(binding.get("name") or "").strip()
+    btype = str(binding.get("type") or "").strip()
+    if not name or not btype:
+        return None
+    if name in ("DOMAINS", "DEFAULT_DOMAINS"):
+        return None
+
+    if btype == "secret_text":
+        # 无 text 时 PATCH 会继承已有 secret，不会清空
+        return {"type": "secret_text", "name": name}
+
+    if btype == "d1":
+        item: Dict[str, Any] = {"type": "d1", "name": name}
+        db_id = binding.get("database_id") or binding.get("id")
+        if not db_id:
+            return None
+        item["database_id"] = str(db_id)
+        return item
+
+    if btype == "json":
+        item = {"type": "json", "name": name}
+        if "json" in binding:
+            item["json"] = binding["json"]
+        return item
+
+    if btype in ("plain_text", "text"):
+        item = {"type": "plain_text", "name": name}
+        if "text" in binding:
+            item["text"] = str(binding.get("text") or "")
+        elif "value" in binding:
+            item["text"] = str(binding.get("value") or "")
+        return item
+
+    if btype == "kv_namespace":
+        item = {"type": "kv_namespace", "name": name}
+        ns = binding.get("namespace_id") or binding.get("id")
+        if not ns:
+            return None
+        item["namespace_id"] = str(ns)
+        return item
+
+    if btype == "r2_bucket":
+        item = {"type": "r2_bucket", "name": name}
+        bucket = binding.get("bucket_name")
+        if not bucket:
+            return None
+        item["bucket_name"] = str(bucket)
+        return item
+
+    # 未知类型：去掉敏感字段后尽量原样保留，避免误删
+    unsafe_keys = {
+        "text",
+        "value",
+        "secret",
+        "secret_text",
+        "key_base64",
+        "key_jwk",
+        "private_key",
+    }
+    item = {k: v for k, v in binding.items() if k not in unsafe_keys}
+    if "name" not in item or "type" not in item:
+        return None
+    return item
+
+
+def _build_domains_bindings(
+    domains: List[str],
+    *,
+    domains_type: str = "json",
+    include_default: bool = True,
+) -> List[Dict[str, Any]]:
+    cleaned = [str(x).strip().lower() for x in domains if str(x).strip()]
+    out: List[Dict[str, Any]] = []
+    if domains_type == "plain_text":
+        payload = domains_to_json(cleaned)
+        out.append({"type": "plain_text", "name": "DOMAINS", "text": payload})
+        if include_default:
+            out.append({"type": "plain_text", "name": "DEFAULT_DOMAINS", "text": payload})
+    else:
+        out.append({"type": "json", "name": "DOMAINS", "json": cleaned})
+        if include_default:
+            out.append({"type": "json", "name": "DEFAULT_DOMAINS", "json": cleaned})
     return out
 
 
@@ -254,16 +384,19 @@ def read_worker_domains(
     )
     if not settings.get("success"):
         return {"ok": False, "domains": [], "bindings": [], "error": _error_message(settings)}
-    vars_map = _extract_plain_text_vars(settings)
+    vars_map = _extract_domain_vars(settings)
     domains = parse_domains_json(vars_map.get("DOMAINS", ""))
     if not domains:
         domains = parse_domains_json(vars_map.get("DEFAULT_DOMAINS", ""))
     bindings = (settings.get("result") or {}).get("bindings") or []
+    if not isinstance(bindings, list):
+        bindings = []
     return {
         "ok": True,
         "domains": domains,
-        "bindings": bindings if isinstance(bindings, list) else [],
+        "bindings": bindings,
         "raw_vars": vars_map,
+        "domains_binding_type": _detect_domains_binding_type(bindings),
     }
 
 
@@ -315,38 +448,119 @@ def write_worker_domains(
     domains: List[str],
     existing_bindings: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
+    """
+    更新 Worker 的 DOMAINS，同时完整保留 JWT_SECRET / D1 / 其它 bindings。
+
+    禁止「只写 DOMAINS 两个变量」的危险回退：Cloudflare settings bindings
+    是整表替换，不完整列表会删掉 JWT_SECRET、DB 等。
+    """
     payload = domains_to_json(domains)
-    bindings: List[dict] = []
-    for binding in existing_bindings or []:
-        if isinstance(binding, dict) and binding.get("name") not in (
-            "DOMAINS",
-            "DEFAULT_DOMAINS",
-        ):
-            # 保留非密钥类绑定；secret_text 无 text 时仍原样回传可能失败，尽量保留
-            bindings.append(binding)
-    bindings.append({"type": "plain_text", "name": "DOMAINS", "text": payload})
-    bindings.append({"type": "plain_text", "name": "DEFAULT_DOMAINS", "text": payload})
+    source_bindings = existing_bindings
+    if source_bindings is None:
+        current = read_worker_domains(token, account_id, worker_name)
+        if not current.get("ok"):
+            return {
+                "ok": False,
+                "domains_json": payload,
+                "error": f"写入前读取 bindings 失败: {current.get('error')}",
+            }
+        source_bindings = current.get("bindings") or []
+
+    preserved: List[Dict[str, Any]] = []
+    dropped: List[str] = []
+    for binding in source_bindings or []:
+        if not isinstance(binding, dict):
+            continue
+        name = str(binding.get("name") or "")
+        if name in ("DOMAINS", "DEFAULT_DOMAINS"):
+            continue
+        sanitized = _sanitize_binding_for_rewrite(binding)
+        if sanitized is None:
+            dropped.append(f"{name}:{binding.get('type')}")
+            continue
+        preserved.append(sanitized)
+
+    # 关键保护：原有 secret_text / d1 若 sanitize 失败，拒绝写入，避免静默清空
+    critical_missing = []
+    for binding in source_bindings or []:
+        if not isinstance(binding, dict):
+            continue
+        name = str(binding.get("name") or "")
+        btype = str(binding.get("type") or "")
+        if btype not in ("secret_text", "d1"):
+            continue
+        if name in ("DOMAINS", "DEFAULT_DOMAINS"):
+            continue
+        if not any(p.get("name") == name and p.get("type") == btype for p in preserved):
+            critical_missing.append(f"{name}:{btype}")
+    if critical_missing:
+        return {
+            "ok": False,
+            "domains_json": payload,
+            "error": (
+                "拒绝写入：无法安全保留关键绑定 "
+                + ", ".join(critical_missing)
+                + "（避免清空 JWT_SECRET/D1）"
+            ),
+        }
+
+    domains_type = _detect_domains_binding_type(source_bindings)
+    had_default = any(
+        isinstance(b, dict) and b.get("name") == "DEFAULT_DOMAINS"
+        for b in (source_bindings or [])
+    )
+    # 若历史上有 DEFAULT_DOMAINS，或当前没有其它域名变量，则同步写入
+    include_default = had_default or True
+    domain_bindings = _build_domains_bindings(
+        domains, domains_type=domains_type, include_default=include_default
+    )
+    bindings = preserved + domain_bindings
     settings_obj = {"bindings": bindings}
     patch = _cf_multipart_patch_settings(token, account_id, worker_name, settings_obj)
     if patch.get("success"):
-        return {"ok": True, "domains_json": payload, "response": patch}
-    # 回退：仅提交 DOMAINS 两个 plain_text（避免 secret 绑定回传问题）
-    minimal = {
-        "bindings": [
-            {"type": "plain_text", "name": "DOMAINS", "text": payload},
-            {"type": "plain_text", "name": "DEFAULT_DOMAINS", "text": payload},
-        ]
-    }
-    patch2 = _cf_multipart_patch_settings(token, account_id, worker_name, minimal)
-    if patch2.get("success"):
-        return {"ok": True, "domains_json": payload, "response": patch2}
+        # 写后校验：关键绑定与域名必须仍在
+        verify = read_worker_domains(token, account_id, worker_name)
+        if not verify.get("ok"):
+            return {
+                "ok": False,
+                "domains_json": payload,
+                "error": f"写入后校验读取失败: {verify.get('error')}",
+                "response": patch,
+            }
+        after_names = {
+            str(b.get("name") or "")
+            for b in (verify.get("bindings") or [])
+            if isinstance(b, dict)
+        }
+        for item in preserved:
+            name = str(item.get("name") or "")
+            if name and name not in after_names:
+                return {
+                    "ok": False,
+                    "domains_json": payload,
+                    "error": (
+                        f"写入后关键绑定丢失: {name} "
+                        f"(type={item.get('type')})；已拒绝视为成功"
+                    ),
+                    "response": patch,
+                }
+        return {
+            "ok": True,
+            "domains_json": payload,
+            "response": patch,
+            "domains_binding_type": domains_type,
+            "dropped_noncritical": dropped,
+        }
+
+    # 绝不回退到「只写 DOMAINS」——那会删掉 JWT_SECRET / DB
     return {
         "ok": False,
         "domains_json": payload,
         "error": (
-            f"multipart PATCH: {_error_message(patch)}; "
-            f"minimal PATCH: {_error_message(patch2)}"
+            "multipart PATCH 失败（未使用危险 minimal 回退，以免清空 JWT_SECRET/D1）: "
+            + _error_message(patch)
         ),
+        "response": patch,
     }
 
 

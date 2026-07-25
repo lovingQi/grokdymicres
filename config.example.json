@@ -21,6 +21,9 @@
   "grok2api_auto_add_remote": false,
   "grok2api_remote_base": "",
   "grok2api_remote_app_key": "",
+  "grok2api_remote_admin_username": "admin",
+  "grok2api_auto_convert_to_build": true,
+  "grok2api_convert_strategy": "missing",
   "api_reverse_tools": "",
   "cpa_export_enabled": true,
   "cpa_auth_dir": "./cpa_auths",
@@ -38,5 +41,15 @@
   "yyds_jwt": "",
   "cpa_oidc_request_timeout_sec": 15,
   "cpa_oidc_poll_timeout_sec": 15,
-  "grok2api_allow_legacy_full_save": false
+  "grok2api_allow_legacy_full_save": false,
+  "max_accounts": 0,
+  "account_interval_sec": 300,
+  "dynamic_subdomain_enabled": false,
+  "dynamic_subdomain_root": "xbltest.xyz",
+  "cf_api_token": "",
+  "cf_account_id": "",
+  "cf_zone_id": "",
+  "cf_worker_name": "temp-email",
+  "dynamic_subdomain_keep": "mail.xbltest.xyz"
 }
+

@@ -147,10 +147,27 @@ copy config.example.json config.json
 | 配置项 | 说明 |
 | --- | --- |
 | `email_provider` | `duckmail`、`yyds`、`cloudflare` 或 `cloudmail` |
-| `register_count` | 本批次目标数量，允许范围由配置校验控制 |
+| `register_count` | 本批次目标数量；当 `max_accounts` 为 0 时使用 |
+| `max_accounts` | 总账号槽位上限；`>0` 时优先于 `register_count` |
+| `account_interval_sec` | 仅「注册并保存成功」后等待秒数；最后一号不等；失败/跳过不等 |
 | `proxy` | 主注册流程代理，可留空 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `user_agent` | 浏览器和请求使用的 User-Agent |
+
+### 动态子域（仅 `email_provider=cloudflare`）
+
+每账号先创建随机子域 `*.xbltest.xyz`，写入 Worker 变量 `DOMAINS`，用 `new_address` 验证后只在该域注册；账号结束立刻从 Worker 拆除。子域创建失败：计入 processed/fail，不打开注册页。
+
+| 配置项 | 说明 |
+| --- | --- |
+| `dynamic_subdomain_enabled` | `true` 开启 |
+| `dynamic_subdomain_root` | 固定 `xbltest.xyz` |
+| `cf_api_token` | Cloudflare API Token（Workers/Zone 权限） |
+| `cf_account_id` / `cf_zone_id` | 可选；空则自动解析 |
+| `cf_worker_name` | 默认 `temp-email` |
+| `dynamic_subdomain_keep` | teardown 永不删除的域，默认 `mail.xbltest.xyz` |
+
+开启后忽略 `defaultDomains` 列表，本账号强制使用刚建的子域。
 
 ### DuckMail
 

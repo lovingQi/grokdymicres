@@ -1,0 +1,638 @@
+"""每账号动态创建 / 拆除 Cloudflare temp-email 子域。"""
+
+from __future__ import annotations
+
+import json
+import secrets
+import string
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional
+
+CF_API = "https://api.cloudflare.com/client/v4"
+FIXED_ROOT = "xbltest.xyz"
+
+RESERVED_LABELS = {
+    "www",
+    "ftp",
+    "api",
+    "mail",
+    "admin",
+    "root",
+    "ns1",
+    "ns2",
+    "mx",
+    "smtp",
+    "pop",
+    "imap",
+    "webmail",
+    "cdn",
+    "static",
+    "dev",
+    "test",
+    "staging",
+    "prod",
+    "app",
+    "blog",
+    "shop",
+    "vpn",
+    "git",
+    "ssh",
+    "portal",
+    "status",
+    "docs",
+}
+
+LogFn = Optional[Callable[[str], None]]
+
+
+@dataclass
+class ProvisionResult:
+    ok: bool
+    domain: str = ""
+    error: str = ""
+    domains_json: str = ""
+
+
+def mask_token(token: str) -> str:
+    token = str(token or "")
+    if len(token) <= 8:
+        return "****"
+    return f"...{token[-4:]}"
+
+
+def _log(log: LogFn, message: str) -> None:
+    if log:
+        log(message)
+
+
+def parse_keep_domains(value: str, root: str = FIXED_ROOT) -> List[str]:
+    items = [x.strip().lower() for x in str(value or "").split(",") if x.strip()]
+    if not items:
+        items = [f"mail.{root}"]
+    return items
+
+
+def generate_subdomain(
+    root: str = FIXED_ROOT,
+    *,
+    exclude_labels: Optional[set] = None,
+    min_len: int = 10,
+    max_len: int = 14,
+) -> str:
+    """
+    生成更随机的子域标签：
+    - 默认 10–14 位（不再是 3–4 位）
+    - 字母 + 数字，首字符必须是字母（DNS 更稳妥）
+    - 使用 secrets（密码学随机）而非 random
+    """
+    root = (root or FIXED_ROOT).strip().lower()
+    min_len = max(6, int(min_len))
+    max_len = max(min_len, int(max_len))
+    max_len = min(max_len, 48)  # DNS label 上限 63，留余量
+    blocked = set(RESERVED_LABELS)
+    if exclude_labels:
+        for item in exclude_labels:
+            item = str(item).strip().lower()
+            if not item:
+                continue
+            blocked.add(item.split(".")[0])
+    alphabet_start = string.ascii_lowercase
+    alphabet_rest = string.ascii_lowercase + string.digits
+    for _ in range(2000):
+        n = secrets.randbelow(max_len - min_len + 1) + min_len
+        label = secrets.choice(alphabet_start) + "".join(
+            secrets.choice(alphabet_rest) for _ in range(n - 1)
+        )
+        if label in blocked:
+            continue
+        return f"{label}.{root}"
+    raise RuntimeError("无法生成可用子域标签")
+
+
+def _cf_request(
+    token: str,
+    method: str,
+    path: str,
+    body: Any = None,
+    query: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    url = f"{CF_API}{path}"
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    data = None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {"success": True, "result": None}
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(err_body)
+        except json.JSONDecodeError:
+            parsed = {"success": False, "errors": [{"message": err_body}]}
+        parsed["_http_status"] = exc.code
+        return parsed
+    except urllib.error.URLError as exc:
+        return {"success": False, "errors": [{"message": str(exc.reason)}]}
+
+
+def _error_message(payload: Dict[str, Any]) -> str:
+    errors = payload.get("errors") or []
+    if errors and isinstance(errors[0], dict):
+        return str(errors[0].get("message") or errors[0])
+    if payload.get("_http_status"):
+        return f"HTTP {payload['_http_status']}"
+    return str(payload)
+
+
+def get_zone_id(token: str, root: str, zone_id: str = "") -> str:
+    if zone_id:
+        return zone_id
+    res = _cf_request(token, "GET", "/zones", query={"name": root})
+    if not res.get("success"):
+        raise RuntimeError(f"查询 zone 失败: {_error_message(res)}")
+    results = res.get("result") or []
+    if not results:
+        raise RuntimeError(f"未找到域名 zone: {root}")
+    return str(results[0].get("id") or "")
+
+
+def get_account_id(token: str, zone_id: str, account_id: str = "") -> str:
+    if account_id:
+        return account_id
+    res = _cf_request(token, "GET", f"/zones/{zone_id}")
+    if not res.get("success"):
+        raise RuntimeError(f"查询 account 失败: {_error_message(res)}")
+    account = (res.get("result") or {}).get("account") or {}
+    aid = account.get("id")
+    if not aid:
+        raise RuntimeError("zone 响应中缺少 account.id")
+    return str(aid)
+
+
+def parse_domains_json(value: str) -> List[str]:
+    value = (value or "").strip()
+    if not value:
+        return []
+    try:
+        data = json.loads(value)
+        if isinstance(data, list):
+            return [str(x).strip().lower() for x in data if str(x).strip()]
+    except json.JSONDecodeError:
+        pass
+    return [x.strip().lower() for x in value.split(",") if x.strip()]
+
+
+def domains_to_json(domains: List[str]) -> str:
+    return json.dumps(domains, ensure_ascii=False, separators=(",", ":"))
+
+
+def merge_domains(
+    existing: List[str],
+    *,
+    add: Optional[List[str]] = None,
+    remove: Optional[List[str]] = None,
+) -> List[str]:
+    rem = {x.strip().lower() for x in (remove or []) if x.strip()}
+    out: List[str] = []
+    seen = set()
+    for item in list(existing) + list(add or []):
+        d = str(item).strip().lower()
+        if not d or d in rem or d in seen:
+            continue
+        seen.add(d)
+        out.append(d)
+    return out
+
+
+def _extract_plain_text_vars(settings: Dict[str, Any]) -> Dict[str, str]:
+    result = settings.get("result") or {}
+    out: Dict[str, str] = {}
+    bindings = result.get("bindings")
+    if isinstance(bindings, list):
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                continue
+            name = binding.get("name")
+            btype = binding.get("type")
+            if name in ("DOMAINS", "DEFAULT_DOMAINS") and btype in (
+                "plain_text",
+                "secret_text",
+                "text",
+            ):
+                if "text" in binding:
+                    out[name] = str(binding["text"])
+                elif "value" in binding:
+                    out[name] = str(binding["value"])
+    vars_obj = result.get("vars") or result.get("environment_variables")
+    if isinstance(vars_obj, dict):
+        for key in ("DOMAINS", "DEFAULT_DOMAINS"):
+            if key in vars_obj:
+                value = vars_obj[key]
+                if isinstance(value, dict) and "value" in value:
+                    out[key] = str(value["value"])
+                else:
+                    out[key] = str(value)
+    return out
+
+
+def read_worker_domains(
+    token: str, account_id: str, worker_name: str
+) -> Dict[str, Any]:
+    settings = _cf_request(
+        token, "GET", f"/accounts/{account_id}/workers/scripts/{worker_name}/settings"
+    )
+    if not settings.get("success"):
+        return {"ok": False, "domains": [], "bindings": [], "error": _error_message(settings)}
+    vars_map = _extract_plain_text_vars(settings)
+    domains = parse_domains_json(vars_map.get("DOMAINS", ""))
+    if not domains:
+        domains = parse_domains_json(vars_map.get("DEFAULT_DOMAINS", ""))
+    bindings = (settings.get("result") or {}).get("bindings") or []
+    return {
+        "ok": True,
+        "domains": domains,
+        "bindings": bindings if isinstance(bindings, list) else [],
+        "raw_vars": vars_map,
+    }
+
+
+def _cf_multipart_patch_settings(
+    token: str, account_id: str, worker_name: str, settings_obj: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Workers settings PATCH 要求 multipart/form-data，settings 为 JSON part。"""
+    import uuid
+
+    boundary = f"----GrokRegisterBoundary{uuid.uuid4().hex}"
+    settings_json = json.dumps(settings_obj, ensure_ascii=False)
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="settings"\r\n'
+        f"Content-Type: application/json\r\n\r\n"
+        f"{settings_json}\r\n"
+        f"--{boundary}--\r\n"
+    ).encode("utf-8")
+    url = f"{CF_API}/accounts/{account_id}/workers/scripts/{worker_name}/settings"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="PATCH",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {"success": True, "result": None}
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(err_body)
+        except json.JSONDecodeError:
+            parsed = {"success": False, "errors": [{"message": err_body}]}
+        parsed["_http_status"] = exc.code
+        return parsed
+    except urllib.error.URLError as exc:
+        return {"success": False, "errors": [{"message": str(exc.reason)}]}
+
+
+def write_worker_domains(
+    token: str,
+    account_id: str,
+    worker_name: str,
+    domains: List[str],
+    existing_bindings: Optional[List[dict]] = None,
+) -> Dict[str, Any]:
+    payload = domains_to_json(domains)
+    bindings: List[dict] = []
+    for binding in existing_bindings or []:
+        if isinstance(binding, dict) and binding.get("name") not in (
+            "DOMAINS",
+            "DEFAULT_DOMAINS",
+        ):
+            # 保留非密钥类绑定；secret_text 无 text 时仍原样回传可能失败，尽量保留
+            bindings.append(binding)
+    bindings.append({"type": "plain_text", "name": "DOMAINS", "text": payload})
+    bindings.append({"type": "plain_text", "name": "DEFAULT_DOMAINS", "text": payload})
+    settings_obj = {"bindings": bindings}
+    patch = _cf_multipart_patch_settings(token, account_id, worker_name, settings_obj)
+    if patch.get("success"):
+        return {"ok": True, "domains_json": payload, "response": patch}
+    # 回退：仅提交 DOMAINS 两个 plain_text（避免 secret 绑定回传问题）
+    minimal = {
+        "bindings": [
+            {"type": "plain_text", "name": "DOMAINS", "text": payload},
+            {"type": "plain_text", "name": "DEFAULT_DOMAINS", "text": payload},
+        ]
+    }
+    patch2 = _cf_multipart_patch_settings(token, account_id, worker_name, minimal)
+    if patch2.get("success"):
+        return {"ok": True, "domains_json": payload, "response": patch2}
+    return {
+        "ok": False,
+        "domains_json": payload,
+        "error": (
+            f"multipart PATCH: {_error_message(patch)}; "
+            f"minimal PATCH: {_error_message(patch2)}"
+        ),
+    }
+
+
+def enable_email_routing_subdomain(
+    token: str, zone_id: str, fqdn: str
+) -> Dict[str, Any]:
+    """
+    在 Email Routing → Settings → Subdomains 中启用子域。
+    对应 API: POST /zones/{zone_id}/email/routing/dns  body {"name": "<fqdn>"}
+    需要 Zone Settings Write / DNS Edit 等权限。
+    """
+    import time
+
+    fqdn = str(fqdn or "").strip().lower()
+    if not fqdn or "." not in fqdn:
+        return {"ok": False, "error": "empty or invalid FQDN"}
+    last: Dict[str, Any] = {}
+    # 仅使用完整 FQDN；纯 label 会被 CF 拒绝（must be a subdomains of ...）
+    for attempt in range(1, 4):
+        last = _cf_request(
+            token, "POST", f"/zones/{zone_id}/email/routing/dns", body={"name": fqdn}
+        )
+        if last.get("success"):
+            return {"ok": True, "response": last, "body": {"name": fqdn}}
+        errors = last.get("errors") or []
+        messages = " ".join(
+            str(e.get("message") or e) for e in errors if isinstance(e, dict)
+        ).lower()
+        if any(
+            key in messages
+            for key in ("already", "exists", "enabled", "duplicate", "locked")
+        ):
+            return {
+                "ok": True,
+                "response": last,
+                "body": {"name": fqdn},
+                "already": True,
+            }
+        # 短暂重试：偶发 4xx/限流
+        if attempt < 3:
+            time.sleep(1.0 * attempt)
+    return {
+        "ok": False,
+        "error": _error_message(last),
+        "response": last,
+        "hint": (
+            "当前 API Token 可能缺少 Zone Settings Write / DNS Edit；"
+            "Dashboard 里 Email Routing → Settings → Subdomains 不会自动出现新行。"
+        ),
+    }
+
+
+def disable_email_routing_subdomain(
+    token: str, zone_id: str, fqdn: str
+) -> Dict[str, Any]:
+    """尽力拆除 Email Routing 子域 DNS/设置。"""
+    fqdn = str(fqdn or "").strip().lower()
+    if not fqdn:
+        return {"ok": True}
+    last = _cf_request(
+        token, "DELETE", f"/zones/{zone_id}/email/routing/dns", body={"name": fqdn}
+    )
+    if last.get("success"):
+        return {"ok": True, "response": last, "via": "DELETE email/routing/dns"}
+    errors = last.get("errors") or []
+    messages = " ".join(
+        str(e.get("message") or e) for e in errors if isinstance(e, dict)
+    ).lower()
+    if "not found" in messages or last.get("_http_status") == 404:
+        return {"ok": True, "response": last, "already_absent": True}
+    return {"ok": False, "error": _error_message(last), "response": last}
+
+
+def verify_new_address(
+    worker_base: str,
+    domain: str,
+    path: str = "/api/new_address",
+) -> Dict[str, Any]:
+    """用 curl_cffi 模拟浏览器，避免 Worker 前的 CF 1010 拦截。"""
+    base = (worker_base or "").rstrip("/")
+    if not base:
+        return {"ok": False, "error": "cloudflare_api_base 为空"}
+    url = f"{base}{path if path.startswith('/') else '/' + path}"
+    try:
+        from curl_cffi import requests as cf_requests
+
+        resp = cf_requests.post(
+            url,
+            json={"domain": domain},
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            timeout=30,
+            impersonate="chrome",
+        )
+        try:
+            data = resp.json() if resp.text else {}
+        except Exception:
+            data = {"_raw": (resp.text or "")[:300]}
+        address = ""
+        jwt = ""
+        if isinstance(data, dict):
+            address = str(data.get("address") or data.get("email") or "")
+            jwt = str(data.get("jwt") or data.get("token") or "")
+        ok = resp.status_code < 400 and bool(address and jwt)
+        return {
+            "ok": ok,
+            "status": resp.status_code,
+            "address": address,
+            "error": "" if ok else f"status={resp.status_code} body={str(data)[:300]}",
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def provision_one(cfg: Dict[str, Any], log: LogFn = None) -> ProvisionResult:
+    """创建随机子域：Email Routing 子域 + Worker DOMAINS + new_address 验证。"""
+    token = str(cfg.get("cf_api_token") or "").strip()
+    if not token:
+        return ProvisionResult(ok=False, error="cf_api_token 未配置")
+    root = str(cfg.get("dynamic_subdomain_root") or FIXED_ROOT).strip().lower() or FIXED_ROOT
+    if root != FIXED_ROOT:
+        return ProvisionResult(ok=False, error=f"dynamic_subdomain_root 必须是 {FIXED_ROOT}")
+    worker_name = str(cfg.get("cf_worker_name") or "temp-email").strip() or "temp-email"
+    worker_base = str(cfg.get("cloudflare_api_base") or "").strip()
+    accounts_path = str(cfg.get("cloudflare_path_accounts") or "/api/new_address").strip()
+    if accounts_path and not accounts_path.startswith("/"):
+        accounts_path = "/" + accounts_path
+    keep = parse_keep_domains(str(cfg.get("dynamic_subdomain_keep") or ""), root)
+    # 缺 Email Routing 权限时是否仍继续（默认 false：必须出现在 Subdomains 列表）
+    allow_skip_routing = bool(cfg.get("dynamic_subdomain_allow_skip_email_routing", False))
+
+    last_error = ""
+    for attempt in range(1, 3):
+        try:
+            min_len = int(cfg.get("dynamic_subdomain_label_min_len") or 10)
+            max_len = int(cfg.get("dynamic_subdomain_label_max_len") or 14)
+            domain = generate_subdomain(
+                root,
+                exclude_labels={k.split(".")[0] for k in keep},
+                min_len=min_len,
+                max_len=max_len,
+            )
+            _log(log, f"[*] 动态子域尝试 {attempt}/2: {domain} (token{mask_token(token)})")
+            zone_id = get_zone_id(token, root, str(cfg.get("cf_zone_id") or "").strip())
+            account_id = get_account_id(
+                token, zone_id, str(cfg.get("cf_account_id") or "").strip()
+            )
+
+            # 1) Email Routing Subdomains（你在 Dashboard 看到的那一页）
+            routing = enable_email_routing_subdomain(token, zone_id, domain)
+            if not routing.get("ok"):
+                last_error = (
+                    f"Email Routing 启用子域失败: {routing.get('error')}. "
+                    f"{routing.get('hint') or ''}"
+                )
+                _log(log, f"[!] {last_error}")
+                if not allow_skip_routing:
+                    continue
+                _log(log, "[!] 已配置允许跳过 Email Routing，继续写 Worker DOMAINS（收信可能失败）")
+            else:
+                _log(log, f"[+] Email Routing 子域已启用: {domain}")
+
+            # 2) Worker 变量 DOMAINS（temp-email 允许用哪些后缀建邮箱）
+            current = read_worker_domains(token, account_id, worker_name)
+            existing = list(current.get("domains") or []) if current.get("ok") else []
+            if not current.get("ok"):
+                _log(log, f"[!] 读取 Worker DOMAINS 失败，将从 keep+新域重建: {current.get('error')}")
+                existing = list(keep)
+            merged = merge_domains(existing, add=keep + [domain])
+            written = write_worker_domains(
+                token,
+                account_id,
+                worker_name,
+                merged,
+                existing_bindings=current.get("bindings") if current.get("ok") else None,
+            )
+            if not written.get("ok"):
+                last_error = f"写入 Worker DOMAINS 失败: {written.get('error')}"
+                _log(log, f"[!] {last_error}")
+                if routing.get("ok"):
+                    disable_email_routing_subdomain(token, zone_id, domain)
+                continue
+
+            # 3) new_address 探测（Worker 环境变量偶发延迟，短暂重试）
+            import time
+
+            verify: Dict[str, Any] = {"ok": False}
+            for verify_try in range(1, 4):
+                if verify_try > 1:
+                    time.sleep(1.5 * (verify_try - 1))
+                # 以重新读取 DOMAINS 为准，确认已写入
+                reread = read_worker_domains(token, account_id, worker_name)
+                if reread.get("ok") and domain not in (reread.get("domains") or []):
+                    _log(log, f"[!] Worker DOMAINS 尚未包含 {domain}，重写一次")
+                    write_worker_domains(
+                        token,
+                        account_id,
+                        worker_name,
+                        merged,
+                        existing_bindings=reread.get("bindings") or current.get("bindings"),
+                    )
+                    time.sleep(1.0)
+                verify = verify_new_address(worker_base, domain, path=accounts_path)
+                if verify.get("ok"):
+                    break
+                _log(
+                    log,
+                    f"[!] new_address 验证未通过 ({verify_try}/3): {verify.get('error')}",
+                )
+            if not verify.get("ok"):
+                last_error = f"new_address 验证失败: {verify.get('error')}"
+                _log(log, f"[!] {last_error}")
+                rolled = merge_domains(merged, remove=[domain])
+                write_worker_domains(
+                    token,
+                    account_id,
+                    worker_name,
+                    rolled,
+                    existing_bindings=current.get("bindings") if current.get("ok") else None,
+                )
+                if routing.get("ok"):
+                    disable_email_routing_subdomain(token, zone_id, domain)
+                continue
+            _log(log, f"[+] 动态子域就绪: {domain}")
+            return ProvisionResult(
+                ok=True,
+                domain=domain,
+                domains_json=str(written.get("domains_json") or domains_to_json(merged)),
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            _log(log, f"[!] 动态子域创建异常: {exc}")
+    return ProvisionResult(ok=False, error=last_error or "动态子域创建失败")
+
+
+def teardown_one(domain: str, cfg: Dict[str, Any], log: LogFn = None) -> bool:
+    """从 Worker DOMAINS + Email Routing 拆除子域；失败只记日志。"""
+    domain = str(domain or "").strip().lower()
+    if not domain:
+        return True
+    token = str(cfg.get("cf_api_token") or "").strip()
+    if not token:
+        _log(log, f"[!] teardown 跳过（无 cf_api_token）: {domain}")
+        return False
+    root = str(cfg.get("dynamic_subdomain_root") or FIXED_ROOT).strip().lower() or FIXED_ROOT
+    worker_name = str(cfg.get("cf_worker_name") or "temp-email").strip() or "temp-email"
+    keep = parse_keep_domains(str(cfg.get("dynamic_subdomain_keep") or ""), root)
+    if domain in keep:
+        _log(log, f"[*] teardown 跳过 keep 域: {domain}")
+        return True
+    ok_all = True
+    try:
+        zone_id = get_zone_id(token, root, str(cfg.get("cf_zone_id") or "").strip())
+        account_id = get_account_id(
+            token, zone_id, str(cfg.get("cf_account_id") or "").strip()
+        )
+        current = read_worker_domains(token, account_id, worker_name)
+        existing = list(current.get("domains") or []) if current.get("ok") else []
+        if not current.get("ok"):
+            _log(log, f"[!] teardown 读取 DOMAINS 失败: {current.get('error')}")
+            ok_all = False
+        else:
+            remaining = merge_domains(existing, add=keep, remove=[domain])
+            written = write_worker_domains(
+                token,
+                account_id,
+                worker_name,
+                remaining,
+                existing_bindings=current.get("bindings"),
+            )
+            if not written.get("ok"):
+                _log(log, f"[!] teardown Worker 写入失败 {domain}: {written.get('error')}")
+                ok_all = False
+            else:
+                _log(log, f"[+] 已从 Worker DOMAINS 移除: {domain}")
+
+        routing = disable_email_routing_subdomain(token, zone_id, domain)
+        if routing.get("ok"):
+            _log(log, f"[+] 已拆除 Email Routing 子域: {domain}")
+        else:
+            _log(
+                log,
+                f"[!] Email Routing 拆除失败（可手动在 Subdomains 删除）: "
+                f"{routing.get('error')}",
+            )
+            ok_all = False
+        return ok_all
+    except Exception as exc:
+        _log(log, f"[!] teardown 异常 {domain}: {exc}")
+        return False

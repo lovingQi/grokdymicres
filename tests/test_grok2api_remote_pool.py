@@ -1,4 +1,4 @@
-"""验证 grok2api 远端 token 入池及并发安全回退逻辑。"""
+"""验证 grok2api 远端 token 入池：新版 admin v1 + 旧版回退。"""
 
 import sys
 import types
@@ -17,6 +17,7 @@ sys.modules.setdefault("DrissionPage", drission)
 sys.modules.setdefault("DrissionPage.errors", drission_errors)
 sys.modules.setdefault("curl_cffi", curl_cffi)
 
+import account_outputs
 import grok_register_ttk as app
 
 
@@ -36,23 +37,146 @@ class DummyResponse:
         return self._payload
 
 
+def _sse_complete(payload):
+    return (
+        ": connected\n\n"
+        "event: progress\n"
+        "data: {\"completed\":0,\"total\":1,\"phase\":\"importing\"}\n\n"
+        "event: complete\n"
+        f"data: {payload}\n\n"
+    )
+
+
 class Grok2ApiRemotePoolTests(unittest.TestCase):
     def setUp(self):
         self.original_config = app.config.copy()
+        # 重置 JWT 缓存，避免测试间串扰
+        account_outputs._admin_v1_access_token = ""
+        account_outputs._admin_v1_access_expires_at = 0.0
 
     def tearDown(self):
         app.config = self.original_config
+        account_outputs.config = app.config
+        account_outputs._admin_v1_access_token = ""
+        account_outputs._admin_v1_access_expires_at = 0.0
 
     def _configure(self, **overrides):
         app.config.update({
             "grok2api_remote_base": "https://grok.example.com",
             "grok2api_remote_app_key": "app-secret",
+            "grok2api_remote_admin_username": "admin",
             "grok2api_pool_name": "ssoBasic",
             "grok2api_allow_legacy_full_save": False,
+            "grok2api_auto_convert_to_build": True,
+            "grok2api_convert_strategy": "missing",
             **overrides,
         })
+        account_outputs.config = app.config
+
+    def test_admin_v1_import_and_convert_success(self):
+        self._configure()
+        posts = []
+        gets = []
+
+        def fake_post(url, **kwargs):
+            posts.append((url, kwargs))
+            if url.endswith("/api/admin/v1/auth/login"):
+                return DummyResponse({
+                    "data": {
+                        "admin": {"id": "1", "username": "admin"},
+                        "tokens": {"accessToken": "jwt-token-1"},
+                    }
+                })
+            if url.endswith("/api/admin/v1/accounts/web/import"):
+                return DummyResponse(
+                    status_code=200,
+                    text=_sse_complete('{"created":1,"updated":0,"skipped":0,"synced":0,"syncFailed":0}'),
+                )
+            if url.endswith("/api/admin/v1/accounts/web/convert-to-build"):
+                return DummyResponse(
+                    status_code=200,
+                    text=_sse_complete(
+                        '{"created":1,"linked":0,"skipped":0,"failed":0,"synced":0,"syncFailed":0}'
+                    ),
+                )
+            return DummyResponse(status_code=404, text="404 page not found")
+
+        def fake_get(url, **kwargs):
+            gets.append((url, kwargs))
+            if url.endswith("/api/admin/v1/accounts"):
+                return DummyResponse({
+                    "data": {
+                        "items": [{"id": "42", "email": "a@example.com", "provider": "grok_web"}],
+                        "page": 1,
+                        "pageSize": 20,
+                        "total": 1,
+                    }
+                })
+            return DummyResponse(status_code=404)
+
+        with patch.object(app, "http_post", side_effect=fake_post), \
+                patch.object(app, "http_get", side_effect=fake_get):
+            ok = app.add_token_to_grok2api_remote_pool("sso=abc123", email="a@example.com")
+
+        self.assertTrue(ok)
+        self.assertEqual(posts[0][0], "https://grok.example.com/api/admin/v1/auth/login")
+        self.assertEqual(posts[0][1]["json"], {"username": "admin", "password": "app-secret"})
+        self.assertEqual(posts[1][0], "https://grok.example.com/api/admin/v1/accounts/web/import")
+        self.assertIn("multipart/form-data", posts[1][1]["headers"]["Content-Type"])
+        self.assertEqual(posts[1][1]["headers"]["Authorization"], "Bearer jwt-token-1")
+        self.assertIn(b"abc123", posts[1][1]["data"])
+        self.assertEqual(posts[2][0], "https://grok.example.com/api/admin/v1/accounts/web/convert-to-build")
+        self.assertEqual(posts[2][1]["json"], {"ids": ["42"], "strategy": "missing"})
+        self.assertEqual(len(gets), 1)
+
+    def test_admin_v1_import_without_convert_when_disabled(self):
+        self._configure(grok2api_auto_convert_to_build=False)
+        posts = []
+
+        def fake_post(url, **kwargs):
+            posts.append(url)
+            if url.endswith("/auth/login"):
+                return DummyResponse({
+                    "data": {"tokens": {"accessToken": "jwt-token-2"}}
+                })
+            if url.endswith("/web/import"):
+                return DummyResponse(
+                    status_code=200,
+                    text=_sse_complete('{"created":1,"updated":0,"skipped":0,"synced":0,"syncFailed":0}'),
+                )
+            return DummyResponse(status_code=404)
+
+        with patch.object(app, "http_post", side_effect=fake_post), \
+                patch.object(app, "http_get") as get_mock:
+            ok = app.add_token_to_grok2api_remote_pool("token-xyz", email="b@example.com")
+
+        self.assertTrue(ok)
+        self.assertEqual(len(posts), 2)
+        get_mock.assert_not_called()
+        self.assertTrue(any(u.endswith("/web/import") for u in posts))
+        self.assertFalse(any("convert-to-build" in u for u in posts))
+
+    def test_admin_v1_login_404_falls_back_to_legacy_tokens_add(self):
+        self._configure()
+        calls = []
+
+        def fake_post(url, **kwargs):
+            calls.append(url)
+            if url.endswith("/api/admin/v1/auth/login"):
+                return DummyResponse(status_code=404, text="404 page not found")
+            if url.endswith("/tokens/add"):
+                return DummyResponse({"status": "success", "count": 1})
+            return DummyResponse(status_code=404)
+
+        with patch.object(app, "http_post", side_effect=fake_post):
+            ok = app.add_token_to_grok2api_remote_pool("sso=abc123", email="a@example.com")
+
+        self.assertTrue(ok)
+        self.assertIn("https://grok.example.com/api/admin/v1/auth/login", calls)
+        self.assertIn("https://grok.example.com/tokens/add", calls)
 
     def test_remote_pool_falls_back_to_admin_api_prefix_when_root_tokens_add_is_404(self):
+        """旧版路径测试：直接调用 legacy 函数。"""
         self._configure()
         calls = []
 
@@ -63,7 +187,7 @@ class Grok2ApiRemotePoolTests(unittest.TestCase):
             return DummyResponse({"status": "success", "count": 1})
 
         with patch.object(app, "http_post", side_effect=fake_post):
-            ok = app.add_token_to_grok2api_remote_pool("sso=abc123", email="a@example.com")
+            ok = app.add_token_to_grok2api_remote_pool_legacy("sso=abc123", email="a@example.com")
 
         self.assertTrue(ok)
         self.assertEqual([url for url, _ in calls], [
@@ -89,7 +213,7 @@ class Grok2ApiRemotePoolTests(unittest.TestCase):
             return DummyResponse({"status": "success", "count": 1})
 
         with patch.object(app, "http_post", side_effect=fake_post):
-            ok = app.add_token_to_grok2api_remote_pool("sso=super123", email="a@example.com")
+            ok = app.add_token_to_grok2api_remote_pool_legacy("sso=super123", email="a@example.com")
 
         self.assertTrue(ok)
         self.assertEqual([url for url, _ in calls], [
@@ -121,7 +245,7 @@ class Grok2ApiRemotePoolTests(unittest.TestCase):
 
         with patch.object(app, "http_post", side_effect=fake_post), \
                 patch.object(app, "http_get", side_effect=fake_get):
-            ok = app.add_token_to_grok2api_remote_pool("sso=fallback123", email="a@example.com")
+            ok = app.add_token_to_grok2api_remote_pool_legacy("sso=fallback123", email="a@example.com")
 
         self.assertTrue(ok)
         self.assertEqual([url for url, _ in get_calls], [
@@ -139,7 +263,7 @@ class Grok2ApiRemotePoolTests(unittest.TestCase):
         with patch.object(app, "http_post", return_value=DummyResponse(status_code=404)), \
                 patch.object(app, "http_get") as get_mock:
             with self.assertRaises(app.RemoteTokenCompatibilityError):
-                app.add_token_to_grok2api_remote_pool("abc")
+                app.add_token_to_grok2api_remote_pool_legacy("abc")
         get_mock.assert_not_called()
 
     def test_remote_pool_500_does_not_fallback(self):
@@ -147,7 +271,7 @@ class Grok2ApiRemotePoolTests(unittest.TestCase):
         with patch.object(app, "http_post", return_value=DummyResponse(status_code=500, text="boom")), \
                 patch.object(app, "http_get") as get_mock:
             with self.assertRaises(app.RemoteTokenRequestError):
-                app.add_token_to_grok2api_remote_pool("abc")
+                app.add_token_to_grok2api_remote_pool_legacy("abc")
         get_mock.assert_not_called()
 
     def test_remote_pool_legacy_fallback_rejects_missing_etag(self):
@@ -166,7 +290,13 @@ class Grok2ApiRemotePoolTests(unittest.TestCase):
         with patch.object(app, "http_post", side_effect=fake_post), \
                 patch.object(app, "http_get", side_effect=fake_get):
             with self.assertRaises(app.RemoteTokenCompatibilityError):
-                app.add_token_to_grok2api_remote_pool("abc")
+                app.add_token_to_grok2api_remote_pool_legacy("abc")
+
+    def test_parse_sse_events_extracts_complete(self):
+        text = _sse_complete('{"created":1,"updated":0}')
+        complete, error = app._parse_sse_events(text)
+        self.assertIsNone(error)
+        self.assertEqual(complete.get("created"), 1)
 
 
 if __name__ == "__main__":

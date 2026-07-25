@@ -15,16 +15,29 @@ YYDS_API_BASE = "https://maliapi.215.im/v1"
 config = {}
 _cf_domain_index = 0
 _cloudmail_domain_index = 0
-_OWN_NAMES = {'cloudmail_get_email_and_token', 'get_messages', 'cloudflare_get_messages', 'get_yyds_api_key', 'yyds_generate_username', 'yyds_get_domains', 'yyds_get_email_and_token', 'yyds_get_oai_code', 'get_email_provider', 'cloudflare_get_domains', 'extract_verification_code', 'get_cloudflare_api_base', 'cloudflare_apply_auth_params', 'duckmail_get_oai_code', 'create_account', 'get_yyds_jwt', 'get_message_detail', 'yyds_create_account', 'get_duckmail_api_key', 'get_cloudflare_path', 'cloudflare_create_account', 'cloudflare_get_token', 'cloudflare_get_oai_code', 'get_cloudmail_public_token', 'generate_username', 'yyds_get_message_detail', 'cloudflare_next_default_domain', 'yyds_get_messages', 'yyds_get_token', 'get_domains', 'get_token', 'cloudflare_create_temp_address', 'get_cloudflare_api_key', 'get_cloudmail_path', 'get_cloudmail_api_base', 'cloudmail_get_oai_code', 'cloudflare_build_headers', 'cloudflare_is_admin_create_path', 'cloudmail_next_domain', 'cloudflare_get_message_detail', 'cloudmail_get_messages', 'get_user_agent', 'yyds_pick_domain', '_pick_list_payload', 'get_email_and_token', 'get_oai_code', 'get_cloudflare_auth_mode', 'pick_domain'}
+_forced_cloudflare_domain = None
+_OWN_NAMES = {'cloudmail_get_email_and_token', 'get_messages', 'cloudflare_get_messages', 'get_yyds_api_key', 'yyds_generate_username', 'yyds_get_domains', 'yyds_get_email_and_token', 'yyds_get_oai_code', 'get_email_provider', 'cloudflare_get_domains', 'extract_verification_code', 'get_cloudflare_api_base', 'cloudflare_apply_auth_params', 'duckmail_get_oai_code', 'create_account', 'get_yyds_jwt', 'get_message_detail', 'yyds_create_account', 'get_duckmail_api_key', 'get_cloudflare_path', 'cloudflare_create_account', 'cloudflare_get_token', 'cloudflare_get_oai_code', 'get_cloudmail_public_token', 'generate_username', 'yyds_get_message_detail', 'cloudflare_next_default_domain', 'yyds_get_messages', 'yyds_get_token', 'get_domains', 'get_token', 'cloudflare_create_temp_address', 'get_cloudflare_api_key', 'get_cloudmail_path', 'get_cloudmail_api_base', 'cloudmail_get_oai_code', 'cloudflare_build_headers', 'cloudflare_is_admin_create_path', 'cloudmail_next_domain', 'cloudflare_get_message_detail', 'cloudmail_get_messages', 'get_user_agent', 'yyds_pick_domain', '_pick_list_payload', 'get_email_and_token', 'get_oai_code', 'get_cloudflare_auth_mode', 'pick_domain', 'set_forced_cloudflare_domain', 'get_forced_cloudflare_domain'}
 
 
 def bind_runtime(namespace):
     global config
     config = namespace.get("config", config)
     for name, value in namespace.items():
-        if name.startswith("__") or name in _OWN_NAMES or name in {"config", "_cf_domain_index", "_cloudmail_domain_index"}:
+        if name.startswith("__") or name in _OWN_NAMES or name in {"config", "_cf_domain_index", "_cloudmail_domain_index", "_forced_cloudflare_domain"}:
             continue
         globals()[name] = value
+
+
+def set_forced_cloudflare_domain(domain):
+    """动态子域模式：强制本账号使用指定域名，忽略 defaultDomains 轮换。"""
+    global _forced_cloudflare_domain
+    value = str(domain or "").strip().lower()
+    _forced_cloudflare_domain = value or None
+    return _forced_cloudflare_domain
+
+
+def get_forced_cloudflare_domain():
+    return _forced_cloudflare_domain
 
 
 def normalize_mail_body(*sources):
@@ -286,8 +299,11 @@ def cloudflare_is_admin_create_path(path):
     return str(path or "").rstrip("/").lower() == "/admin/new_address"
 
 def cloudflare_next_default_domain():
-    """按配置轮换选择 Cloudflare 临时邮箱域名。"""
+    """按配置轮换选择 Cloudflare 临时邮箱域名；forced 时固定返回。"""
     global _cf_domain_index
+    forced = get_forced_cloudflare_domain()
+    if forced:
+        return forced
     domains = [x.strip() for x in str(config.get("defaultDomains", "") or "").split(",") if x.strip()]
     if not domains:
         return ""

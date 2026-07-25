@@ -29,6 +29,9 @@ DEFAULT_CONFIG = {
     "grok2api_auto_add_remote": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
+    "grok2api_remote_admin_username": "admin",
+    "grok2api_auto_convert_to_build": True,
+    "grok2api_convert_strategy": "missing",
     "api_reverse_tools": "",
     "cpa_export_enabled": True,
     "cpa_auth_dir": "./cpa_auths",
@@ -47,6 +50,18 @@ DEFAULT_CONFIG = {
     "yyds_api_key": "",
     "yyds_jwt": "",
     "defaultDomains": "",
+    "max_accounts": 0,
+    "account_interval_sec": 300,
+    "dynamic_subdomain_enabled": False,
+    "dynamic_subdomain_root": "xbltest.xyz",
+    "dynamic_subdomain_label_min_len": 10,
+    "dynamic_subdomain_label_max_len": 14,
+    "dynamic_subdomain_allow_skip_email_routing": False,
+    "cf_api_token": "",
+    "cf_account_id": "",
+    "cf_zone_id": "",
+    "cf_worker_name": "temp-email",
+    "dynamic_subdomain_keep": "mail.xbltest.xyz",
 }
 
 
@@ -90,16 +105,34 @@ def validate_config_structure(raw):
     cfg = {**DEFAULT_CONFIG, **raw}
     bool_keys = (
         "enable_nsfw", "grok2api_auto_add_local", "grok2api_auto_add_remote",
-        "grok2api_allow_legacy_full_save", "cpa_export_enabled",
+        "grok2api_allow_legacy_full_save", "grok2api_auto_convert_to_build",
+        "cpa_export_enabled",
         "cpa_copy_to_hotload", "cpa_headless", "cpa_force_standalone",
-        "cpa_mint_cookie_inject",
+        "cpa_mint_cookie_inject", "dynamic_subdomain_enabled",
+        "dynamic_subdomain_allow_skip_email_routing",
     )
     for key in bool_keys:
         cfg[key] = _require_bool(cfg, key)
     cfg["register_count"] = _require_int(cfg, "register_count", 1, 2500)
+    cfg["max_accounts"] = _require_int(cfg, "max_accounts", 0, 2500)
+    cfg["account_interval_sec"] = _require_int(cfg, "account_interval_sec", 0, 86400)
+    cfg["dynamic_subdomain_label_min_len"] = _require_int(
+        cfg, "dynamic_subdomain_label_min_len", 6, 48
+    )
+    cfg["dynamic_subdomain_label_max_len"] = _require_int(
+        cfg, "dynamic_subdomain_label_max_len", 6, 48
+    )
+    if cfg["dynamic_subdomain_label_min_len"] > cfg["dynamic_subdomain_label_max_len"]:
+        raise ConfigError(
+            "配置项 dynamic_subdomain_label_min_len 不能大于 dynamic_subdomain_label_max_len"
+        )
     cfg["cpa_mint_timeout_sec"] = _require_int(cfg, "cpa_mint_timeout_sec", 30, 1800)
     cfg["cpa_oidc_request_timeout_sec"] = _require_int(cfg, "cpa_oidc_request_timeout_sec", 3, 120)
     cfg["cpa_oidc_poll_timeout_sec"] = _require_int(cfg, "cpa_oidc_poll_timeout_sec", 3, 120)
+    root = str(cfg.get("dynamic_subdomain_root") or "").strip().lower()
+    if root != "xbltest.xyz":
+        raise ConfigError("配置项 dynamic_subdomain_root 必须是 xbltest.xyz")
+    cfg["dynamic_subdomain_root"] = root
     string_keys = tuple(key for key, value in DEFAULT_CONFIG.items() if isinstance(value, str))
     path_keys = {"grok2api_local_token_file", "api_reverse_tools", "cpa_auth_dir", "cpa_hotload_dir"}
     for key in string_keys:
@@ -108,6 +141,7 @@ def validate_config_structure(raw):
         "email_provider": {"duckmail", "yyds", "cloudflare", "cloudmail"},
         "cloudflare_auth_mode": {"query-key", "bearer", "x-api-key", "x-admin-auth", "none"},
         "grok2api_pool_name": {"ssoBasic", "ssoSuper"},
+        "grok2api_convert_strategy": {"missing", "all"},
     }
     for key, allowed in enums.items():
         value = cfg.get(key, DEFAULT_CONFIG.get(key, ""))
@@ -168,7 +202,29 @@ def validate_run_requirements(cfg):
             raise ConfigError("远端 token 入池缺少必需配置: " + ", ".join(missing))
     if cfg["cpa_export_enabled"] and cfg["cpa_copy_to_hotload"] and not cfg["cpa_hotload_dir"]:
         raise ConfigError("启用 CPA 热加载复制时必须配置 cpa_hotload_dir")
+    if (
+        cfg.get("dynamic_subdomain_enabled")
+        and cfg.get("email_provider") == "cloudflare"
+        and not str(cfg.get("cf_api_token") or "").strip()
+    ):
+        raise ConfigError("启用动态子域时必须配置 cf_api_token")
     return cfg
+
+
+def resolve_batch_count(cfg):
+    """优先使用 max_accounts；为 0 时回退 register_count。"""
+    cfg = cfg or {}
+    max_accounts = cfg.get("max_accounts", 0)
+    try:
+        max_accounts = int(max_accounts)
+    except (TypeError, ValueError):
+        max_accounts = 0
+    if max_accounts > 0:
+        return max_accounts
+    try:
+        return int(cfg.get("register_count", 1) or 1)
+    except (TypeError, ValueError):
+        return 1
 
 
 def validate_config(raw):

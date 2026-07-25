@@ -51,8 +51,7 @@ import mail_service as _mail_service
 import registration_browser as _registration_browser
 from app_config import (
     DEFAULT_CONFIG, ConfigError, config, load_config, save_config,
-    resolve_batch_count, validate_config, validate_config_structure,
-    validate_run_requirements,
+    validate_config, validate_config_structure, validate_run_requirements,
 )
 
 
@@ -284,7 +283,7 @@ for _name in ['get_configured_proxy', 'get_proxies', '_parse_proxy_url', '_safe_
         continue
     if _name != "LocalAuthProxyBridge":
         globals()[_name] = _make_compat_proxy(_browser_runtime, _name, _bind_browser_runtime)
-for _name in ['resolve_grok2api_local_token_file', '_normalize_sso_token', 'add_token_to_grok2api_local_pool', 'get_grok2api_remote_api_bases', 'add_token_to_grok2api_remote_pool', 'add_token_to_grok2api_remote_pool_admin_v1', 'add_token_to_grok2api_remote_pool_legacy', 'add_token_to_grok2api_pools', '_parse_sse_events', '_admin_v1_login', '_admin_v1_import_web_sso', '_admin_v1_find_web_account_id', '_admin_v1_convert_web_to_build']:
+for _name in ['resolve_grok2api_local_token_file', '_normalize_sso_token', 'add_token_to_grok2api_local_pool', 'get_grok2api_remote_api_bases', 'add_token_to_grok2api_remote_pool', 'add_token_to_grok2api_pools']:
     globals()[_name] = _make_compat_proxy(_account_outputs, _name, _bind_account_outputs)
 _MAIL_ORIGINALS = dict((name, getattr(_mail_service, name)) for name in ['_pick_list_payload', 'cloudflare_apply_auth_params', 'cloudflare_build_headers', 'cloudflare_create_account', 'cloudflare_create_temp_address', 'cloudflare_get_domains', 'cloudflare_get_message_detail', 'cloudflare_get_messages', 'cloudflare_get_oai_code', 'cloudflare_get_token', 'cloudflare_is_admin_create_path', 'cloudflare_next_default_domain', 'cloudmail_get_email_and_token', 'cloudmail_get_messages', 'cloudmail_get_oai_code', 'cloudmail_next_domain', 'create_account', 'duckmail_get_oai_code', 'extract_verification_code', 'generate_username', 'get_cloudflare_api_base', 'get_cloudflare_api_key', 'get_cloudflare_auth_mode', 'get_cloudflare_path', 'get_cloudmail_api_base', 'get_cloudmail_path', 'get_cloudmail_public_token', 'get_domains', 'get_duckmail_api_key', 'get_email_and_token', 'get_email_provider', 'get_message_detail', 'get_messages', 'get_oai_code', 'get_token', 'get_user_agent', 'get_yyds_api_key', 'get_yyds_jwt', 'pick_domain', 'yyds_create_account', 'yyds_generate_username', 'yyds_get_domains', 'yyds_get_email_and_token', 'yyds_get_message_detail', 'yyds_get_messages', 'yyds_get_oai_code', 'yyds_get_token', 'yyds_pick_domain'])
 _MAIL_COMPAT_PROXIES = dict()
@@ -635,45 +634,7 @@ def retry_pending_file(pending_path, output_path=None, log_callback=None):
 
 
 def run_registration_common(count, log_callback, cancel_callback, accounts_output_file, observer):
-    from registration_flow import (
-        RegistrationCallbacks,
-        RegistrationOperations,
-        RegistrationSettings,
-        SlotPrepareResult,
-        run_batch,
-    )
-    from dynamic_subdomain import provision_one, teardown_one
-    from mail_service import set_forced_cloudflare_domain
-
-    dynamic_enabled = bool(config.get("dynamic_subdomain_enabled")) and (
-        str(config.get("email_provider") or "") == "cloudflare"
-    )
-    account_interval_sec = int(config.get("account_interval_sec", 0) or 0)
-    slot_state = {"domain": None}
-
-    def before_account(slot_index, total):
-        if not dynamic_enabled:
-            return SlotPrepareResult(ok=True)
-        log_callback(f"[*] 动态子域: 准备第 {slot_index}/{total} 个账号的专用域名")
-        result = provision_one(config, log=log_callback)
-        if not result.ok:
-            set_forced_cloudflare_domain(None)
-            slot_state["domain"] = None
-            return SlotPrepareResult(ok=False, skip=True, error=result.error or "provision failed")
-        set_forced_cloudflare_domain(result.domain)
-        slot_state["domain"] = result.domain
-        log_callback(f"[*] 本账号强制使用域名: {result.domain}")
-        return SlotPrepareResult(ok=True, domain=result.domain)
-
-    def after_account():
-        domain = slot_state.get("domain")
-        try:
-            if domain:
-                teardown_one(domain, config, log=log_callback)
-        finally:
-            set_forced_cloudflare_domain(None)
-            slot_state["domain"] = None
-
+    from registration_flow import RegistrationCallbacks, RegistrationOperations, run_batch
     callbacks = RegistrationCallbacks(log=log_callback, cancelled=cancel_callback)
     operations = RegistrationOperations(
         start_browser=lambda: start_browser(log_callback=log_callback),
@@ -697,17 +658,6 @@ def run_registration_common(count, log_callback, cancel_callback, accounts_outpu
         sleep=lambda seconds: sleep_with_cancel(seconds, cancel_callback),
         cancelled_exception=RegistrationCancelled,
         retry_exception=AccountRetryNeeded,
-        before_account=before_account if dynamic_enabled else None,
-        after_account=after_account if dynamic_enabled else None,
-    )
-    settings = RegistrationSettings(
-        count=int(count),
-        enable_nsfw=bool(config.get("enable_nsfw", True)),
-        cleanup_interval=MEMORY_CLEANUP_INTERVAL,
-        max_slot_retry=3,
-        max_mail_retry=3,
-        account_interval_sec=account_interval_sec,
-        delay_browser_start=dynamic_enabled,
     )
     return run_batch(
         count=count,
@@ -718,7 +668,6 @@ def run_registration_common(count, log_callback, cancel_callback, accounts_outpu
         cleanup_interval=MEMORY_CLEANUP_INTERVAL,
         max_slot_retry=3,
         max_mail_retry=3,
-        settings=settings,
     )
 
 
@@ -787,7 +736,7 @@ class GrokRegisterGUI:
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
 
         add_label(0, 2, "注册数量:")
-        self.count_var = tk.StringVar(value=str(resolve_batch_count(config)))
+        self.count_var = tk.StringVar(value=str(config.get("register_count", 1)))
         self.count_spinbox = tk.Spinbox(
             config_frame,
             from_=1,
@@ -1044,13 +993,10 @@ class GrokRegisterGUI:
         try:
             count = int(self.count_var.get())
             config["register_count"] = count
-            if int(config.get("max_accounts", 0) or 0) > 0:
-                config["max_accounts"] = count
             validated = validate_run_requirements(config)
             config.clear()
             config.update(validated)
             save_config()
-            count = resolve_batch_count(config)
         except (ValueError, ConfigError) as exc:
             self.log(f"[!] 配置无效或保存失败: {exc}")
             return
@@ -1171,18 +1117,9 @@ def main_cli():
     except ConfigError as exc:
         cli_log(f"[!] {exc}")
         return
-    count = resolve_batch_count(config)
+    count = int(config.get("register_count", 1) or 1)
     cli_log("[*] CLI 已加载配置")
-    cli_log(
-        f"[*] 当前邮箱服务商: {config.get('email_provider', 'duckmail')} | "
-        f"有效上限: {count} (max_accounts={config.get('max_accounts', 0)}, "
-        f"register_count={config.get('register_count', 1)})"
-    )
-    cli_log(
-        f"[*] 动态子域: {bool(config.get('dynamic_subdomain_enabled'))} | "
-        f"账号间隔秒: {config.get('account_interval_sec', 0)} | "
-        f"根域: {config.get('dynamic_subdomain_root', 'xbltest.xyz')}"
-    )
+    cli_log(f"[*] 当前邮箱服务商: {config.get('email_provider', 'duckmail')} | 注册数量: {count}")
     cli_log("[*] 输入 start 后开始；按 Ctrl+C 可强制停止")
     try:
         command = input("> ").strip().lower()

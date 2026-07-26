@@ -57,6 +57,9 @@ DEFAULT_CONFIG = {
     "dynamic_subdomain_label_min_len": 10,
     "dynamic_subdomain_label_max_len": 14,
     "dynamic_subdomain_allow_skip_email_routing": False,
+    "dynamic_subdomain_purge_on_start": True,
+    "dynamic_subdomain_routing_soft_limit": 25,
+    "dynamic_subdomain_teardown_retries": 3,
     "cf_api_token": "",
     "cf_account_id": "",
     "cf_zone_id": "",
@@ -110,6 +113,7 @@ def validate_config_structure(raw):
         "cpa_copy_to_hotload", "cpa_headless", "cpa_force_standalone",
         "cpa_mint_cookie_inject", "dynamic_subdomain_enabled",
         "dynamic_subdomain_allow_skip_email_routing",
+        "dynamic_subdomain_purge_on_start",
     )
     for key in bool_keys:
         cfg[key] = _require_bool(cfg, key)
@@ -121,6 +125,12 @@ def validate_config_structure(raw):
     )
     cfg["dynamic_subdomain_label_max_len"] = _require_int(
         cfg, "dynamic_subdomain_label_max_len", 6, 48
+    )
+    cfg["dynamic_subdomain_routing_soft_limit"] = _require_int(
+        cfg, "dynamic_subdomain_routing_soft_limit", 1, 30
+    )
+    cfg["dynamic_subdomain_teardown_retries"] = _require_int(
+        cfg, "dynamic_subdomain_teardown_retries", 1, 5
     )
     if cfg["dynamic_subdomain_label_min_len"] > cfg["dynamic_subdomain_label_max_len"]:
         raise ConfigError(

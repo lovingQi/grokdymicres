@@ -165,9 +165,13 @@ copy config.example.json config.json
 | `cf_api_token` | Cloudflare API Token（Workers/Zone 权限） |
 | `cf_account_id` / `cf_zone_id` | 可选；空则自动解析 |
 | `cf_worker_name` | 默认 `temp-email` |
-| `dynamic_subdomain_keep` | teardown 永不删除的域，默认 `mail.xbltest.xyz` |
+| `dynamic_subdomain_keep` | teardown/清扫永不删除的域，默认 `mail.xbltest.xyz` |
+| `dynamic_subdomain_purge_on_start` | 批次开始前清扫非 keep 的 Email Routing 残留，并收敛 Worker `DOMAINS` |
+| `dynamic_subdomain_routing_soft_limit` | Email Routing 子域数达到该值时，在创建新域前再清扫（默认 25；CF 上限约 30） |
+| `dynamic_subdomain_teardown_retries` | Routing DELETE + 列表复查的重试次数（默认 3） |
 
-开启后忽略 `defaultDomains` 列表，本账号强制使用刚建的子域。
+开启后忽略 `defaultDomains` 列表，本账号强制使用刚建的子域。  
+Cloudflare Email Routing 每个 zone 约有 **30** 个子域上限；拆除时会 `DELETE` 后再拉取列表复查，避免「Worker 已删、Routing 仍占坑」。
 
 ### DuckMail
 

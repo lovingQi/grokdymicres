@@ -642,18 +642,36 @@ def run_registration_common(count, log_callback, cancel_callback, accounts_outpu
         SlotPrepareResult,
         run_batch,
     )
-    from dynamic_subdomain import provision_one, teardown_one
+    from dynamic_subdomain import (
+        count_email_routing_subdomains,
+        provision_one,
+        purge_email_routing_residuals,
+        teardown_one,
+    )
     from mail_service import set_forced_cloudflare_domain
 
     dynamic_enabled = bool(config.get("dynamic_subdomain_enabled")) and (
         str(config.get("email_provider") or "") == "cloudflare"
     )
     account_interval_sec = int(config.get("account_interval_sec", 0) or 0)
+    soft_limit = int(config.get("dynamic_subdomain_routing_soft_limit", 25) or 25)
     slot_state = {"domain": None}
+
+    if dynamic_enabled and bool(config.get("dynamic_subdomain_purge_on_start", True)):
+        log_callback("[*] 动态子域: 批次开始前清扫非 keep 的 Email Routing 残留")
+        purge_email_routing_residuals(config, log=log_callback)
+        log_callback("[*] 若本进程刚热更新代码，建议重启 CLI 后再大批量跑号")
 
     def before_account(slot_index, total):
         if not dynamic_enabled:
             return SlotPrepareResult(ok=True)
+        counted = count_email_routing_subdomains(config)
+        if counted.get("ok") and int(counted.get("count") or 0) >= soft_limit:
+            log_callback(
+                f"[*] Email Routing 子域数 {counted.get('count')} ≥ 软顶 {soft_limit}，"
+                "provision 前再次清扫残留"
+            )
+            purge_email_routing_residuals(config, log=log_callback)
         log_callback(f"[*] 动态子域: 准备第 {slot_index}/{total} 个账号的专用域名")
         result = provision_one(config, log=log_callback)
         if not result.ok:
@@ -669,7 +687,9 @@ def run_registration_common(count, log_callback, cancel_callback, accounts_outpu
         domain = slot_state.get("domain")
         try:
             if domain:
-                teardown_one(domain, config, log=log_callback)
+                ok = teardown_one(domain, config, log=log_callback)
+                if not ok:
+                    log_callback(f"[!] 本账号子域 teardown 未完全成功: {domain}")
         finally:
             set_forced_cloudflare_domain(None)
             slot_state["domain"] = None

@@ -613,25 +613,101 @@ def enable_email_routing_subdomain(
     }
 
 
-def disable_email_routing_subdomain(
+def list_email_routing_subdomains(token: str, zone_id: str) -> Dict[str, Any]:
+    """列出 Email Routing → Settings → Subdomains 中的全部 FQDN。"""
+    res = _cf_request(token, "GET", f"/zones/{zone_id}/email/routing")
+    if not res.get("success"):
+        return {"ok": False, "domains": [], "error": _error_message(res), "response": res}
+    result = res.get("result") or {}
+    subs = result.get("subdomains") if isinstance(result, dict) else None
+    if not isinstance(subs, list):
+        subs = []
+    domains: List[str] = []
+    seen = set()
+    for item in subs:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip().lower()
+        if name and name not in seen:
+            seen.add(name)
+            domains.append(name)
+    return {"ok": True, "domains": domains, "response": res}
+
+
+def email_routing_has_subdomain(
     token: str, zone_id: str, fqdn: str
+) -> Optional[bool]:
+    """True=仍在列表, False=已不在, None=查询失败。"""
+    fqdn = str(fqdn or "").strip().lower()
+    listed = list_email_routing_subdomains(token, zone_id)
+    if not listed.get("ok"):
+        return None
+    return fqdn in (listed.get("domains") or [])
+
+
+def disable_email_routing_subdomain(
+    token: str,
+    zone_id: str,
+    fqdn: str,
+    *,
+    retries: int = 3,
 ) -> Dict[str, Any]:
-    """尽力拆除 Email Routing 子域 DNS/设置。"""
+    """拆除 Email Routing 子域：DELETE 后必须 list 复查，禁止仅凭 not found 判成功。"""
+    import time
+
     fqdn = str(fqdn or "").strip().lower()
     if not fqdn:
-        return {"ok": True}
-    last = _cf_request(
-        token, "DELETE", f"/zones/{zone_id}/email/routing/dns", body={"name": fqdn}
-    )
-    if last.get("success"):
-        return {"ok": True, "response": last, "via": "DELETE email/routing/dns"}
-    errors = last.get("errors") or []
-    messages = " ".join(
-        str(e.get("message") or e) for e in errors if isinstance(e, dict)
-    ).lower()
-    if "not found" in messages or last.get("_http_status") == 404:
-        return {"ok": True, "response": last, "already_absent": True}
-    return {"ok": False, "error": _error_message(last), "response": last}
+        return {"ok": True, "verified": True, "attempts": 0}
+    retries = max(1, min(int(retries or 3), 5))
+    last: Dict[str, Any] = {}
+    for attempt in range(1, retries + 1):
+        present = email_routing_has_subdomain(token, zone_id, fqdn)
+        if present is False:
+            return {
+                "ok": True,
+                "verified": True,
+                "attempts": attempt,
+                "already_absent": True,
+                "via": "list_before_delete",
+            }
+        last = _cf_request(
+            token, "DELETE", f"/zones/{zone_id}/email/routing/dns", body={"name": fqdn}
+        )
+        # 无论 DELETE 成功/not found，都必须复查列表
+        present_after = email_routing_has_subdomain(token, zone_id, fqdn)
+        if present_after is False:
+            return {
+                "ok": True,
+                "verified": True,
+                "attempts": attempt,
+                "response": last,
+                "via": "DELETE email/routing/dns + list verify",
+                "delete_success": bool(last.get("success")),
+            }
+        if present_after is None:
+            err = "Email Routing 列表复查失败，无法确认子域已拆除"
+        elif last.get("success"):
+            err = f"DELETE 返回成功但列表仍含 {fqdn}"
+        else:
+            err = _error_message(last) or f"拆除后列表仍含 {fqdn}"
+        if attempt < retries:
+            time.sleep(0.5 * attempt)
+            continue
+        return {
+            "ok": False,
+            "verified": False,
+            "attempts": attempt,
+            "error": err,
+            "response": last,
+            "still_present": present_after is True,
+        }
+    return {
+        "ok": False,
+        "verified": False,
+        "attempts": retries,
+        "error": _error_message(last) or "Email Routing 拆除失败",
+        "response": last,
+    }
 
 
 def verify_new_address(
@@ -796,7 +872,7 @@ def provision_one(cfg: Dict[str, Any], log: LogFn = None) -> ProvisionResult:
 
 
 def teardown_one(domain: str, cfg: Dict[str, Any], log: LogFn = None) -> bool:
-    """从 Worker DOMAINS + Email Routing 拆除子域；失败只记日志。"""
+    """从 Worker DOMAINS + Email Routing 拆除子域；两侧都成功才返回 True。"""
     domain = str(domain or "").strip().lower()
     if not domain:
         return True
@@ -807,6 +883,7 @@ def teardown_one(domain: str, cfg: Dict[str, Any], log: LogFn = None) -> bool:
     root = str(cfg.get("dynamic_subdomain_root") or FIXED_ROOT).strip().lower() or FIXED_ROOT
     worker_name = str(cfg.get("cf_worker_name") or "temp-email").strip() or "temp-email"
     keep = parse_keep_domains(str(cfg.get("dynamic_subdomain_keep") or ""), root)
+    retries = int(cfg.get("dynamic_subdomain_teardown_retries") or 3)
     if domain in keep:
         _log(log, f"[*] teardown 跳过 keep 域: {domain}")
         return True
@@ -836,13 +913,15 @@ def teardown_one(domain: str, cfg: Dict[str, Any], log: LogFn = None) -> bool:
             else:
                 _log(log, f"[+] 已从 Worker DOMAINS 移除: {domain}")
 
-        routing = disable_email_routing_subdomain(token, zone_id, domain)
-        if routing.get("ok"):
-            _log(log, f"[+] 已拆除 Email Routing 子域: {domain}")
+        routing = disable_email_routing_subdomain(
+            token, zone_id, domain, retries=retries
+        )
+        if routing.get("ok") and routing.get("verified", True):
+            _log(log, f"[+] 已拆除 Email Routing 子域（已复查）: {domain}")
         else:
             _log(
                 log,
-                f"[!] Email Routing 拆除失败（可手动在 Subdomains 删除）: "
+                f"[!] Email Routing 拆除未通过复查: {domain}（Worker 可能已移除）: "
                 f"{routing.get('error')}",
             )
             ok_all = False
@@ -850,3 +929,113 @@ def teardown_one(domain: str, cfg: Dict[str, Any], log: LogFn = None) -> bool:
     except Exception as exc:
         _log(log, f"[!] teardown 异常 {domain}: {exc}")
         return False
+
+
+def purge_email_routing_residuals(
+    cfg: Dict[str, Any], log: LogFn = None
+) -> Dict[str, Any]:
+    """删除所有非 keep 的 Email Routing 子域，并将 Worker DOMAINS 收敛为 keep。"""
+    token = str(cfg.get("cf_api_token") or "").strip()
+    root = str(cfg.get("dynamic_subdomain_root") or FIXED_ROOT).strip().lower() or FIXED_ROOT
+    worker_name = str(cfg.get("cf_worker_name") or "temp-email").strip() or "temp-email"
+    keep = parse_keep_domains(str(cfg.get("dynamic_subdomain_keep") or ""), root)
+    keep_set = set(keep)
+    retries = int(cfg.get("dynamic_subdomain_teardown_retries") or 3)
+    empty = {
+        "ok": False,
+        "kept": list(keep),
+        "removed": [],
+        "failed": [],
+        "before": 0,
+        "after": 0,
+    }
+    if not token:
+        empty["error"] = "cf_api_token 未配置"
+        _log(log, f"[!] 残留清扫跳过: {empty['error']}")
+        return empty
+    try:
+        zone_id = get_zone_id(token, root, str(cfg.get("cf_zone_id") or "").strip())
+        account_id = get_account_id(
+            token, zone_id, str(cfg.get("cf_account_id") or "").strip()
+        )
+        listed = list_email_routing_subdomains(token, zone_id)
+        if not listed.get("ok"):
+            empty["error"] = listed.get("error") or "list Email Routing 失败"
+            _log(log, f"[!] 残留清扫失败: {empty['error']}")
+            return empty
+        domains = list(listed.get("domains") or [])
+        before = len(domains)
+        to_remove = [d for d in domains if d not in keep_set]
+        removed: List[str] = []
+        failed: List[Dict[str, str]] = []
+        for domain in to_remove:
+            routing = disable_email_routing_subdomain(
+                token, zone_id, domain, retries=retries
+            )
+            if routing.get("ok") and routing.get("verified", True):
+                removed.append(domain)
+            else:
+                failed.append(
+                    {"domain": domain, "error": str(routing.get("error") or "unknown")}
+                )
+
+        # Worker DOMAINS 收敛为 keep
+        current = read_worker_domains(token, account_id, worker_name)
+        worker_ok = True
+        if current.get("ok"):
+            written = write_worker_domains(
+                token,
+                account_id,
+                worker_name,
+                list(keep),
+                existing_bindings=current.get("bindings"),
+            )
+            if not written.get("ok"):
+                worker_ok = False
+                _log(
+                    log,
+                    f"[!] 残留清扫：Worker DOMAINS 收敛失败: {written.get('error')}",
+                )
+            else:
+                _log(log, f"[+] 残留清扫：Worker DOMAINS 已收敛为 keep ({', '.join(keep)})")
+        else:
+            worker_ok = False
+            _log(log, f"[!] 残留清扫：读取 Worker DOMAINS 失败: {current.get('error')}")
+
+        after_list = list_email_routing_subdomains(token, zone_id)
+        after_domains = list(after_list.get("domains") or []) if after_list.get("ok") else []
+        after = len(after_domains) if after_list.get("ok") else before
+        ok = worker_ok and not failed and after_list.get("ok") is True
+        _log(
+            log,
+            f"[*] 残留清扫: Routing {before}→{after}, 删除 {len(removed)}, 失败 {len(failed)}",
+        )
+        return {
+            "ok": ok,
+            "kept": [d for d in after_domains if d in keep_set] or list(keep),
+            "removed": removed,
+            "failed": failed,
+            "before": before,
+            "after": after,
+        }
+    except Exception as exc:
+        empty["error"] = str(exc)
+        _log(log, f"[!] 残留清扫异常: {exc}")
+        return empty
+
+
+def count_email_routing_subdomains(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """供 soft_limit 判断：返回当前 Email Routing 子域数量。"""
+    token = str(cfg.get("cf_api_token") or "").strip()
+    root = str(cfg.get("dynamic_subdomain_root") or FIXED_ROOT).strip().lower() or FIXED_ROOT
+    if not token:
+        return {"ok": False, "count": 0, "error": "cf_api_token 未配置"}
+    try:
+        zone_id = get_zone_id(token, root, str(cfg.get("cf_zone_id") or "").strip())
+        listed = list_email_routing_subdomains(token, zone_id)
+        if not listed.get("ok"):
+            return {"ok": False, "count": 0, "error": listed.get("error")}
+        domains = list(listed.get("domains") or [])
+        return {"ok": True, "count": len(domains), "domains": domains}
+    except Exception as exc:
+        return {"ok": False, "count": 0, "error": str(exc)}

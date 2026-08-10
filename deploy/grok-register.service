@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=grok
-Group=grok
-WorkingDirectory=/opt/grok-register
-ExecStart=/opt/grok-register/deploy/run_xvfb.sh
+User=root
+Group=root
+WorkingDirectory=/root/grokdymicres
+ExecStart=/root/grokdymicres/deploy/run_xvfb.sh
 Restart=always
 RestartSec=120
 Nice=10

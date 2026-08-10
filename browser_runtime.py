@@ -146,15 +146,31 @@ def apply_browser_proxy_option(options, proxy):
         options.set_argument("--proxy-server", proxy)
 
 
+def _resolve_linux_browser_path():
+    """优先 Google Chrome，与本地 WSL 环境对齐。"""
+    for candidate in (
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return ""
+
+
 def create_browser_options(browser_proxy="", extension_path=None):
     options = ChromiumOptions()
     options.auto_port()
     options.set_timeouts(base=1)
     if sys.platform.startswith("linux"):
+        browser_path = _resolve_linux_browser_path()
+        if browser_path and hasattr(options, "set_browser_path"):
+            options.set_browser_path(browser_path)
         for flag in (
             "--no-sandbox",
             "--disable-dev-shm-usage",
-            "--disable-gpu",
+            "--window-size=1280,900",
         ):
             options.set_argument(flag)
     apply_browser_proxy_option(options, browser_proxy)

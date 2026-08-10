@@ -1,5 +1,6 @@
 """提供共享的 HTTP 请求、代理处理和 Chromium 启动参数。"""
 import os
+import sys
 import urllib.parse
 
 from DrissionPage import ChromiumOptions
@@ -149,6 +150,13 @@ def create_browser_options(browser_proxy="", extension_path=None):
     options = ChromiumOptions()
     options.auto_port()
     options.set_timeouts(base=1)
+    if sys.platform.startswith("linux"):
+        for flag in (
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ):
+            options.set_argument(flag)
     apply_browser_proxy_option(options, browser_proxy)
     effective_extension = _extension_path if extension_path is None else str(extension_path or "")
     if effective_extension and os.path.exists(effective_extension):

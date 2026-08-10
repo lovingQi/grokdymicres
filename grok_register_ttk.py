@@ -1178,19 +1178,33 @@ def run_registration_cli(count):
         cli_log(f"[*] 任务结束。成功 {last_stats['success']} | 失败 {last_stats['fail']} | 待恢复 {last_stats['pending']} | 后处理警告 {last_stats['warnings']}")
 
 
-def main_cli():
+def _cli_wants_autostart(argv):
+    """无人值守：autostart 子命令，或 cli/start/--cli 带 --yes。"""
+    if not argv:
+        return False
+    mode = argv[0].strip().lower()
+    if mode == "autostart":
+        return True
+    if mode in ("start", "cli", "--cli") and any(
+        arg.strip().lower() == "--yes" for arg in argv[1:]
+    ):
+        return True
+    return False
+
+
+def main_cli(autostart=False):
     try:
         load_config()
     except ConfigError as exc:
         cli_log(f"[!] {exc}")
-        return
+        sys.exit(1)
     try:
         validated = validate_run_requirements(config)
         config.clear()
         config.update(validated)
     except ConfigError as exc:
         cli_log(f"[!] {exc}")
-        return
+        sys.exit(1)
     count = resolve_batch_count(config)
     cli_log("[*] CLI 已加载配置")
     cli_log(
@@ -1203,6 +1217,10 @@ def main_cli():
         f"账号间隔秒: {config.get('account_interval_sec', 0)} | "
         f"根域: {config.get('dynamic_subdomain_root', 'xbltest.xyz')}"
     )
+    if autostart:
+        cli_log("[*] 无人值守模式：跳过 start 确认，立即开始；按 Ctrl+C 可强制停止")
+        run_registration_cli(count)
+        return
     cli_log("[*] 输入 start 后开始；按 Ctrl+C 可强制停止")
     try:
         command = input("> ").strip().lower()
@@ -1232,8 +1250,11 @@ def main():
         except Exception as exc:
             log_exception("pending 恢复失败", exc, cli_log)
         return
+    if len(sys.argv) > 1 and _cli_wants_autostart(sys.argv[1:]):
+        main_cli(autostart=True)
+        return
     if len(sys.argv) > 1 and sys.argv[1].strip().lower() in ("start", "cli", "--cli"):
-        main_cli()
+        main_cli(autostart=False)
         return
     if not TK_AVAILABLE:
         print(f"[!] GUI 模式需要 Tkinter，但当前环境不可用: {TK_IMPORT_ERROR}", file=sys.stderr)

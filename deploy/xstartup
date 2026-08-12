@@ -1,0 +1,8 @@
+#!/bin/sh
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+export XKL_XMODMAP_DISABLE=1
+if command -v dbus-launch >/dev/null 2>&1; then
+  eval "$(dbus-launch --sh-syntax)"
+fi
+exec startxfce4
